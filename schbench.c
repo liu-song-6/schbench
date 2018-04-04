@@ -675,7 +675,7 @@ static void run_msg_thread(struct thread_data *td)
 		 * messages shouldn't be instant, sleep a little to make them
 		 * wait
 		 */
-		if (!pipe_test && sleeptime) {
+		if (sleeptime) {
 			jitter = rand_r(&seed) % max_jitter;
 			usleep(sleeptime + jitter);
 		}
