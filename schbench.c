@@ -20,6 +20,7 @@
 #include <string.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 
 #define PLAT_BITS	8
 #define PLAT_VAL	(1 << PLAT_BITS)
@@ -46,6 +47,8 @@ static int autobench = 0;
 static int pipe_test = 0;
 /* -R requests per sec */
 static int requests_per_sec = 0;
+/* -l list of CPUs to pin message threads, as "0-14,31-35" */
+static char *cpuliststr = NULL;
 
 /* the message threads flip this to true when they decide runtime is up */
 static volatile unsigned long stopping = 0;
@@ -73,7 +76,7 @@ enum {
 	HELP_LONG_OPT = 1,
 };
 
-char *option_string = "p:am:t:s:c:r:R:";
+char *option_string = "p:am:t:s:c:r:R:l:";
 static struct option long_options[] = {
 	{"auto", no_argument, 0, 'a'},
 	{"pipe", required_argument, 0, 'p'},
@@ -83,6 +86,7 @@ static struct option long_options[] = {
 	{"rps", required_argument, 0, 'R'},
 	{"sleeptime", required_argument, 0, 's'},
 	{"cputime", required_argument, 0, 'c'},
+	{"message-thread-cpus", required_argument, 0, 'l'},
 	{"help", no_argument, 0, HELP_LONG_OPT},
 	{0, 0, 0, 0}
 };
@@ -93,13 +97,47 @@ static void print_usage(void)
 		"\t-m (--message-threads): number of message threads (def: 2)\n"
 		"\t-t (--threads): worker threads per message thread (def: 16)\n"
 		"\t-r (--runtime): How long to run before exiting (seconds, def: 30)\n"
-		"\t-s (--sleeptime): Message thread latency (usec, def: 10000\n"
+		"\t-s (--sleeptime): Message thread latency (usec, def: 10000)\n"
 		"\t-c (--cputime): How long to think during loop (usec, def: 10000\n"
 		"\t-a (--auto): grow thread count until latencies hurt (def: off)\n"
 		"\t-p (--pipe): transfer size bytes to simulate a pipe test (def: 0)\n"
 		"\t-R (--rps): requests per second mode (count, def: 0)\n"
+		"\t-l (--message-thread-cpus): list of CPUs to pin message threads (e.g. 0-1,3-5, default: don't pin)\n"
 	       );
 	exit(1);
+}
+
+static int parse_cpu_list(int list[], int len, char *str)
+{
+	int from = 0, to = 0;
+	int i = 0;
+	char c;
+	int *n = &from;
+
+	while (1) {
+		c = *str;
+		if (c >= '0' && c <= '9')
+			*n = *n * 10 + (c - '0');
+		else if (c == '-') {
+			if (n == &from)
+				n = &to;
+			else
+				return -1;
+		} else if (c == ',' || c == '\0') {
+			if (n == &from && i < len)
+				list[i++] = from;
+			else
+				while (from <= to && i < len)
+					list[i++] = from++;
+			from = 0;
+			to = 0;
+			n = &from;
+		}
+		if (c == '\0')
+			break;
+		str++;
+	}
+	return i;
 }
 
 static void parse_options(int ac, char **av)
@@ -148,6 +186,9 @@ static void parse_options(int ac, char **av)
 			break;
 		case 'R':
 			requests_per_sec = atoi(optarg);
+			break;
+		case 'l':
+			cpuliststr = optarg;
 			break;
 		case '?':
 		case HELP_LONG_OPT:
@@ -824,12 +865,20 @@ void *message_thread(void *arg)
 	struct thread_data *worker_threads_mem = NULL;
 	int i;
 	int ret;
+	int nproc = get_nprocs();
+	cpu_set_t cpuset;
 
 	worker_threads_mem = calloc(worker_threads, sizeof(struct thread_data));
 
 	if (!worker_threads_mem) {
 		perror("unable to allocate ram");
 		pthread_exit((void *)-ENOMEM);
+	}
+
+	if (cpuliststr) {
+		CPU_ZERO(&cpuset);
+		for (i = 0; i < nproc; i++)
+			CPU_SET(i, &cpuset);
 	}
 
 	for (i = 0; i < worker_threads; i++) {
@@ -842,6 +891,16 @@ void *message_thread(void *arg)
 			fprintf(stderr, "error %d from pthread_create\n", ret);
 			exit(1);
 		}
+
+		if (cpuliststr) {
+			/* set smp affinity of worker threads to all CPUs */
+			ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+			if (ret) {
+				fprintf(stderr, "error %d from pthread_setaffinity_np\n", ret);
+				exit(1);
+			}
+		}
+
 		worker_threads_mem[i].tid = tid;
 	}
 
@@ -913,6 +972,9 @@ int main(int ac, char **av)
 	int p99 = 0;
 	int p95 = 0;
 	double diff;
+	int nproc = get_nprocs();
+	int *cpulist = calloc(nproc, sizeof(int));
+	int msgcpus = 0;
 
 	parse_options(ac, av);
 	if (autobench && requests_per_sec == 1) {
@@ -938,15 +1000,40 @@ again:
 		exit(1);
 	}
 
+	if (cpuliststr) {
+		if (!cpulist) {
+			perror("unable to allocate memory for cpulist");
+			exit(1);
+		}
+
+		msgcpus = parse_cpu_list(cpulist, nproc, cpuliststr);
+		if (msgcpus < 0) {
+			perror("unable to parse list of CPUs");
+			exit(1);
+		}
+	}
+
 	/* start our message threads, each one starts its own workers */
 	for (i = 0; i < message_threads; i++) {
 		pthread_t tid;
+		cpu_set_t cpuset;
 		ret = pthread_create(&tid, NULL, message_thread,
 				     message_threads_mem + i);
 		if (ret) {
 			fprintf(stderr, "error %d from pthread_create\n", ret);
 			exit(1);
 		}
+
+		if (cpuliststr) {
+			CPU_ZERO(&cpuset);
+			CPU_SET(cpulist[i % msgcpus], &cpuset);
+			ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+			if (ret) {
+				fprintf(stderr, "error %d from pthread_setaffinity_np\n", ret);
+				exit(1);
+			}
+		}
+
 		message_threads_mem[i].tid = tid;
 	}
 
